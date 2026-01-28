@@ -228,8 +228,11 @@ bool AtUart::ParseResponse() {
         return true;
     }
 
+    // Extract one line (without CRLF) for pattern matching
+    std::string line = rx_buffer_.substr(0, end_pos);
+
     if (debug_) {
-        ESP_LOGI(TAG, "<< %.64s (%u bytes) [%02x%02x%02x]", rx_buffer_.substr(0, end_pos).c_str(), end_pos,
+        ESP_LOGI(TAG, "<< %.64s (%u bytes) [%02x%02x%02x]", line.c_str(), end_pos,
             rx_buffer_[0], rx_buffer_[1], rx_buffer_[2]);
     }
     // print last 64 bytes before end_pos if available
@@ -237,8 +240,23 @@ bool AtUart::ParseResponse() {
     //     ESP_LOGI(TAG, "<< LAST: %.64s", rx_buffer_.c_str() + end_pos - 64);
     // }
 
-    // Parse "+CME ERROR: 123,456,789"
-    if (rx_buffer_[0] == '+') {
+    auto make_string_arg = [](const std::string& s) {
+        AtArgumentValue a;
+        a.type = AtArgumentValue::Type::String;
+        a.string_value = s;
+        return a;
+    };
+    auto make_int_arg = [](int v) {
+        AtArgumentValue a;
+        a.type = AtArgumentValue::Type::Int;
+        a.int_value = v;
+        a.string_value = std::to_string(v);
+        return a;
+    };
+
+    // Parse "+CMD: ..." and "^CMD: ..." URCs
+    if (rx_buffer_[0] == '+' || rx_buffer_[0] == '^') {
+        const char prefix = rx_buffer_[0];
         std::string command, values;
         auto pos = rx_buffer_.find(": ");
         if (pos == std::string::npos || pos > end_pos) {
@@ -274,6 +292,106 @@ bool AtUart::ParseResponse() {
 
         HandleUrc(command, arguments);
         return true;
+    }
+
+    // Handle common plain-text URCs (e.g., Air780E): CONNECT OK / DATA ACCEPT / SUBACK ...
+    // These lines are not prefixed with '+' and otherwise would be treated as normal responses,
+    // which breaks async state machines and SendCommandWithData().
+    auto handle_plain_urc = [&](const std::string& cmd, std::vector<AtArgumentValue>&& args,
+                                bool mark_done, bool mark_error) {
+        rx_buffer_.erase(0, end_pos + 2);
+        HandleUrc(cmd, args);
+        if (wait_for_response_) {
+            if (mark_error) {
+                xEventGroupSetBits(event_group_handle_, AT_EVENT_COMMAND_ERROR);
+            } else if (mark_done) {
+                xEventGroupSetBits(event_group_handle_, AT_EVENT_COMMAND_DONE);
+            }
+        }
+        return true;
+    };
+
+    // Patterns like "0,CONNECT OK" / "3,SEND FAIL"
+    {
+        size_t comma = line.find(',');
+        if (comma != std::string::npos) {
+            std::string left = line.substr(0, comma);
+            std::string right = line.substr(comma + 1);
+            // trim spaces in right
+            while (!right.empty() && (right.front() == ' ' || right.front() == '\t')) right.erase(0, 1);
+            while (!right.empty() && (right.back() == ' ' || right.back() == '\t')) right.pop_back();
+            if (is_number(left)) {
+                int link_id = std::stoi(left);
+                if (right == "CONNECT OK") {
+                    return handle_plain_urc("CONNECT", {make_int_arg(link_id), make_string_arg("OK")}, true, false);
+                } else if (right == "CONNECT FAIL") {
+                    return handle_plain_urc("CONNECT", {make_int_arg(link_id), make_string_arg("FAIL")}, false, true);
+                } else if (right == "ALREADY CONNECT") {
+                    return handle_plain_urc("CONNECT", {make_int_arg(link_id), make_string_arg("ALREADY")}, true, false);
+                } else if (right == "CLOSE OK") {
+                    return handle_plain_urc("CLOSE", {make_int_arg(link_id), make_string_arg("OK")}, true, false);
+                } else if (right == "SEND OK") {
+                    return handle_plain_urc("SEND", {make_int_arg(link_id), make_string_arg("OK")}, true, false);
+                } else if (right == "SEND FAIL") {
+                    return handle_plain_urc("SEND", {make_int_arg(link_id), make_string_arg("FAIL")}, false, true);
+                }
+            }
+        }
+    }
+
+    // Single-link patterns
+    if (line == "CONNECT OK") {
+        return handle_plain_urc("CONNECT", {make_string_arg("OK")}, true, false);
+    } else if (line == "CONNECT FAIL") {
+        return handle_plain_urc("CONNECT", {make_string_arg("FAIL")}, false, true);
+    } else if (line == "ALREADY CONNECT") {
+        return handle_plain_urc("CONNECT", {make_string_arg("ALREADY")}, true, false);
+    } else if (line == "CLOSE OK") {
+        return handle_plain_urc("CLOSE", {make_string_arg("OK")}, true, false);
+    } else if (line == "SEND OK") {
+        return handle_plain_urc("SEND", {make_string_arg("OK")}, true, false);
+    } else if (line == "SEND FAIL") {
+        return handle_plain_urc("SEND", {make_string_arg("FAIL")}, false, true);
+    } else if (line == "SUBACK") {
+        return handle_plain_urc("SUBACK", {}, true, false);
+    } else if (line == "UNSUBACK") {
+        return handle_plain_urc("UNSUBACK", {}, true, false);
+    } else if (line == "CONNACK OK") {
+        return handle_plain_urc("CONNACK", {make_string_arg("OK")}, true, false);
+    } else if (line == "PUBACK") {
+        return handle_plain_urc("PUBACK", {}, true, false);
+    } else if (line == "PUBREC") {
+        return handle_plain_urc("PUBREC", {}, true, false);
+    } else if (line == "PUBCOMP") {
+        return handle_plain_urc("PUBCOMP", {}, true, false);
+    }
+
+    // DATA ACCEPT / DATAACCEPT (single-link or multi-link)
+    // Examples:
+    // - DATA ACCEPT:10
+    // - DATAACCEPT:10
+    // - DATA ACCEPT:3,10
+    if (line.rfind("DATA ACCEPT:", 0) == 0 || line.rfind("DATAACCEPT:", 0) == 0) {
+        std::string payload = line.substr(line.find(':') + 1);
+        // remove spaces
+        while (!payload.empty() && (payload.front() == ' ' || payload.front() == '\t')) payload.erase(0, 1);
+        std::vector<AtArgumentValue> args;
+        // split by comma
+        size_t c = payload.find(',');
+        if (c == std::string::npos) {
+            if (is_number(payload)) args.push_back(make_int_arg(std::stoi(payload)));
+            else args.push_back(make_string_arg(payload));
+        } else {
+            std::string a = payload.substr(0, c);
+            std::string b = payload.substr(c + 1);
+            while (!a.empty() && (a.back() == ' ' || a.back() == '\t')) a.pop_back();
+            while (!b.empty() && (b.front() == ' ' || b.front() == '\t')) b.erase(0, 1);
+            if (is_number(a)) args.push_back(make_int_arg(std::stoi(a)));
+            else args.push_back(make_string_arg(a));
+            if (is_number(b)) args.push_back(make_int_arg(std::stoi(b)));
+            else args.push_back(make_string_arg(b));
+        }
+        return handle_plain_urc("DATAACCEPT", std::move(args), true, false);
     } else if (rx_buffer_.size() >= 4 && rx_buffer_[0] == 'O' && rx_buffer_[1] == 'K' && rx_buffer_[2] == '\r' && rx_buffer_[3] == '\n') {
         rx_buffer_.erase(0, 4);
         xEventGroupSetBits(event_group_handle_, AT_EVENT_COMMAND_DONE);
@@ -287,7 +405,7 @@ bool AtUart::ParseResponse() {
         return true;
     } else {
         std::lock_guard<std::mutex> lock(mutex_);
-        response_ = rx_buffer_.substr(0, end_pos);
+        response_ = std::move(line);
         rx_buffer_.erase(0, end_pos + 2);
         return true;
     }

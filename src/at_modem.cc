@@ -1,6 +1,7 @@
 #include "at_modem.h"
 #include "ml307/ml307_at_modem.h"
 #include "ec801e/ec801e_at_modem.h"
+#include "air780e/air780e_at_modem.h"
 #include <esp_log.h>
 #include <esp_err.h>
 #include <sstream>
@@ -24,7 +25,7 @@ std::unique_ptr<AtModem> AtModem::Detect(gpio_num_t tx_pin, gpio_num_t rx_pin, g
         return nullptr;
     }
     
-    // 发送AT+CGMR（或ATI）命令获取模组型号
+    // 发送 AT+CGMR（或 ATI）命令获取模组型号
     if (!uart->SendCommand("AT+CGMR", 3000)) {
         ESP_LOGE(TAG, "Failed to send AT+CGMR command");
         return nullptr;
@@ -40,7 +41,25 @@ std::unique_ptr<AtModem> AtModem::Detect(gpio_num_t tx_pin, gpio_num_t rx_pin, g
         return std::make_unique<Ec801EAtModem>(uart);
     } else if (response.find("ML307") == 0) {
         return std::make_unique<Ml307AtModem>(uart);
+    } else if (response.find("Air780") != std::string::npos || response.find("AIR780") != std::string::npos ||
+               response.find("Air700") != std::string::npos || response.find("AIR700") != std::string::npos) {
+        return std::make_unique<Air780EAtModem>(uart);
     } else {
+        // 某些固件的 AT+CGMR 只回版本号，不包含模组型号；再用 ATI 做一次兜底识别
+        if (uart->SendCommand("ATI", 3000)) {
+            std::string ati = uart->GetResponse();
+            ESP_LOGI(TAG, "ATI: %s", ati.c_str());
+            if (ati.find("EC801E") != std::string::npos || ati.find("NT26K") != std::string::npos) {
+                return std::make_unique<Ec801EAtModem>(uart);
+            }
+            if (ati.find("ML307") != std::string::npos) {
+                return std::make_unique<Ml307AtModem>(uart);
+            }
+            if (ati.find("Air780") != std::string::npos || ati.find("AIR780") != std::string::npos ||
+                ati.find("Air700") != std::string::npos || ati.find("AIR700") != std::string::npos) {
+                return std::make_unique<Air780EAtModem>(uart);
+            }
+        }
         ESP_LOGE(TAG, "Unrecognized modem type: %s, use ML307 AtModem as default", response.c_str());
         return std::make_unique<Ml307AtModem>(uart);
     }
